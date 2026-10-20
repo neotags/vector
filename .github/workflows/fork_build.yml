@@ -1,0 +1,140 @@
+# Fork-only build: Linux binaries (x86_64 + aarch64) and a multi-arch image on GHCR.
+#
+# Unlike publish.yml this needs no upstream runners, Docker Hub, AWS or S3. It only uses
+# GitHub-hosted runners and the built-in GITHUB_TOKEN.
+name: Fork Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Branch, tag or SHA to build"
+        required: false
+        default: ""
+      features:
+        description: "Cargo features, replacing the defaults. Empty builds with default features (slow)."
+        required: false
+        default: ""
+      image_tag:
+        description: "Image tag. Empty uses sha-<short sha>."
+        required: false
+        default: ""
+      push_image:
+        description: "Push the image to ghcr.io/<owner>/vector"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Vector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.git_ref }}
+      - uses: ./.github/actions/setup
+        with:
+          rust: true
+          protoc: true
+          libsasl2: true
+      - name: Build Vector
+        env:
+          FEATURES: ${{ inputs.features }}
+        run: |
+          if [ -n "$FEATURES" ]; then
+            cargo build --release --target "${{ matrix.target }}" --no-default-features --features "$FEATURES"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/vector" "dist/vector-${{ matrix.arch }}"
+          tar -czf "dist/vector-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" vector
+      - name: Stage binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vector-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  image:
+    name: Build and push image
+    needs: build
+    if: inputs.push_image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Vector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.git_ref }}
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: vector-*-unknown-linux-gnu
+          path: artifacts
+          merge-multiple: true
+      - name: Prepare image context
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          mkdir -p context
+          cp artifacts/vector-amd64 artifacts/vector-arm64 context/
+          chmod +x context/vector-*
+          cat > context/Dockerfile <<'DOCKERFILE'
+          FROM docker.io/debian:trixie-slim
+          ARG TARGETARCH
+          # hadolint ignore=DL3008
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata libsasl2-2 \
+              && rm -rf /var/lib/apt/lists/* \
+              && mkdir -p /var/lib/vector /etc/vector
+          COPY vector-${TARGETARCH} /usr/bin/vector
+          RUN ["vector", "--version"]
+          ENTRYPOINT ["/usr/bin/vector"]
+          DOCKERFILE
+          # GHCR requires a lowercase repository name.
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          tag="${IMAGE_TAG:-sha-${GITHUB_SHA::10}}"
+          echo "IMAGE=ghcr.io/${owner}/vector:${tag}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
