@@ -15,6 +15,11 @@ on:
         description: "Cargo features, replacing the defaults. Empty builds with default features (slow)."
         required: false
         default: ""
+      lto:
+        description: "Release LTO mode: thin uses far less memory than fat (upstream default)"
+        type: choice
+        options: [thin, fat, "off"]
+        default: thin
       image_tag:
         description: "Image tag. Empty uses sha-<short sha>."
         required: false
@@ -62,6 +67,7 @@ jobs:
       - name: Build Vector
         env:
           FEATURES: ${{ inputs.features }}
+          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.lto || 'thin' }}
         run: |
           if [ -n "$FEATURES" ]; then
             cargo build --release --target "${{ matrix.target }}" --no-default-features --features "$FEATURES"
