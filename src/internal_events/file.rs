@@ -1,21 +1,16 @@
-#![allow(dead_code)] // TODO requires optional feature compilation
-
-use std::borrow::Cow;
-
 use vector_lib::{
     NamedInternalEvent,
     configurable::configurable_component,
-    counter, gauge,
-    internal_event::{
-        ComponentEventsDropped, CounterName, GaugeName, INTENTIONAL, InternalEvent, UNINTENTIONAL,
-        error_stage, error_type,
-    },
+    gauge,
+    internal_event::{GaugeName, InternalEvent},
 };
 
-use crate::sinks::util::path_confinement::ConfineError;
-
+#[cfg(feature = "sources-file")]
+pub(crate) use self::file_source::*;
+#[cfg(feature = "sinks-file")]
+pub(crate) use self::sink::*;
 #[cfg(any(feature = "sources-file", feature = "sources-kubernetes_logs"))]
-pub use self::source::*;
+pub(crate) use self::source::*;
 
 /// Configuration of internal metrics for file-based components.
 #[configurable_component]
@@ -31,7 +26,7 @@ pub struct FileInternalMetricsConfig {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct FileOpen {
+pub(crate) struct FileOpen {
     pub count: usize,
 }
 
@@ -43,121 +38,128 @@ impl InternalEvent for FileOpen {
     }
 }
 
-#[derive(Debug, NamedInternalEvent)]
-pub struct FileBytesSent<'a> {
-    pub byte_size: usize,
-    pub file: Cow<'a, str>,
-    pub include_file_metric_tag: bool,
-}
+#[cfg(feature = "sinks-file")]
+mod sink {
+    use std::borrow::Cow;
 
-impl InternalEvent for FileBytesSent<'_> {
-    fn emit(self) {
-        trace!(
-            message = "Bytes sent.",
-            byte_size = %self.byte_size,
-            protocol = "file",
-            file = %self.file,
-        );
-        if self.include_file_metric_tag {
-            counter!(
-                CounterName::ComponentSentBytesTotal,
-                "protocol" => "file",
-                "file" => self.file.clone().into_owned(),
-            )
-        } else {
-            counter!(
-                CounterName::ComponentSentBytesTotal,
-                "protocol" => "file",
-            )
-        }
-        .increment(self.byte_size as u64);
+    use vector_lib::{
+        NamedInternalEvent, counter, emit,
+        internal_event::{
+            ComponentEventsDropped, CounterName, INTENTIONAL, InternalEvent, UNINTENTIONAL,
+            error_stage, error_type,
+        },
+    };
+
+    use crate::sinks::util::path_confinement::ConfineError;
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub(crate) struct FileBytesSent<'a> {
+        pub byte_size: usize,
+        pub file: Cow<'a, str>,
+        pub include_file_metric_tag: bool,
     }
-}
 
-#[derive(Debug, NamedInternalEvent)]
-pub struct FileIoError<'a, P> {
-    pub error: std::io::Error,
-    pub code: &'static str,
-    pub message: &'static str,
-    pub path: &'a P,
-    pub dropped_events: usize,
-}
+    impl InternalEvent for FileBytesSent<'_> {
+        fn emit(self) {
+            trace!(
+                message = "Bytes sent.",
+                byte_size = %self.byte_size,
+                protocol = "file",
+                file = %self.file,
+            );
+            if self.include_file_metric_tag {
+                counter!(
+                    CounterName::ComponentSentBytesTotal,
+                    "protocol" => "file",
+                    "file" => self.file.clone().into_owned(),
+                )
+            } else {
+                counter!(
+                    CounterName::ComponentSentBytesTotal,
+                    "protocol" => "file",
+                )
+            }
+            .increment(self.byte_size as u64);
+        }
+    }
 
-impl<P: std::fmt::Debug> InternalEvent for FileIoError<'_, P> {
-    fn emit(self) {
-        error!(
-            message = %self.message,
-            path = ?self.path,
-            error = %self.error,
-            error_code = %self.code,
-            error_type = error_type::IO_FAILED,
-            stage = error_stage::SENDING,
-        );
-        counter!(
-            CounterName::ComponentErrorsTotal,
-            "error_code" => self.code,
-            "error_type" => error_type::IO_FAILED,
-            "stage" => error_stage::SENDING,
-        )
-        .increment(1);
+    #[derive(Debug, NamedInternalEvent)]
+    pub(crate) struct FileIoError<'a, P> {
+        pub error: std::io::Error,
+        pub code: &'static str,
+        pub message: &'static str,
+        pub path: &'a P,
+        pub dropped_events: usize,
+    }
 
-        if self.dropped_events > 0 {
-            emit!(ComponentEventsDropped::<UNINTENTIONAL> {
-                count: self.dropped_events,
-                reason: self.message,
+    impl<P: std::fmt::Debug> InternalEvent for FileIoError<'_, P> {
+        fn emit(self) {
+            error!(
+                message = %self.message,
+                path = ?self.path,
+                error = %self.error,
+                error_code = %self.code,
+                error_type = error_type::IO_FAILED,
+                stage = error_stage::SENDING,
+            );
+            counter!(
+                CounterName::ComponentErrorsTotal,
+                "error_code" => self.code,
+                "error_type" => error_type::IO_FAILED,
+                "stage" => error_stage::SENDING,
+            )
+            .increment(1);
+
+            if self.dropped_events > 0 {
+                emit!(ComponentEventsDropped::<UNINTENTIONAL> {
+                    count: self.dropped_events,
+                    reason: self.message,
+                });
+            }
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub(crate) struct FilePathOutsideBaseDirError<'a> {
+        pub path: &'a std::path::Path,
+        pub base_dir: &'a std::path::Path,
+        pub error: ConfineError,
+    }
+
+    impl InternalEvent for FilePathOutsideBaseDirError<'_> {
+        fn emit(self) {
+            error!(
+                message = "Rendered path is outside the configured base directory; dropping event.",
+                path = ?self.path,
+                base_dir = ?self.base_dir,
+                error = %self.error,
+                error_type = error_type::CONFINEMENT_FAILED,
+                stage = error_stage::PROCESSING,
+            );
+            counter!(
+                CounterName::ComponentErrorsTotal,
+                "error_type" => error_type::CONFINEMENT_FAILED,
+                "stage" => error_stage::PROCESSING,
+            )
+            .increment(1);
+            emit!(ComponentEventsDropped::<INTENTIONAL> {
+                count: 1,
+                reason: "Rendered path outside base_dir.",
             });
         }
     }
 }
 
-#[derive(Debug, NamedInternalEvent)]
-pub struct FilePathOutsideBaseDirError<'a> {
-    pub path: &'a std::path::Path,
-    pub base_dir: &'a std::path::Path,
-    pub error: ConfineError,
-}
-
-impl InternalEvent for FilePathOutsideBaseDirError<'_> {
-    fn emit(self) {
-        error!(
-            message = "Rendered path is outside the configured base directory; dropping event.",
-            path = ?self.path,
-            base_dir = ?self.base_dir,
-            error = %self.error,
-            error_type = error_type::CONFINEMENT_FAILED,
-            stage = error_stage::PROCESSING,
-        );
-        counter!(
-            CounterName::ComponentErrorsTotal,
-            "error_type" => error_type::CONFINEMENT_FAILED,
-            "stage" => error_stage::PROCESSING,
-        )
-        .increment(1);
-        emit!(ComponentEventsDropped::<INTENTIONAL> {
-            count: 1,
-            reason: "Rendered path outside base_dir.",
-        });
-    }
-}
-
-#[cfg(any(feature = "sources-file", feature = "sources-kubernetes_logs"))]
-mod source {
-    use std::{io::Error, path::Path, time::Duration};
-
-    use bytes::BytesMut;
+#[cfg(feature = "sources-file")]
+mod file_source {
     use vector_lib::{
-        NamedInternalEvent, counter, emit,
-        file_source_common::internal_events::FileSourceInternalEvents,
-        internal_event::{
-            ComponentEventsDropped, CounterName, INTENTIONAL, error_stage, error_type,
-        },
+        NamedInternalEvent, counter,
+        internal_event::{CounterName, InternalEvent},
         json_size::JsonSize,
     };
 
-    use super::{FileOpen, InternalEvent};
-
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileBytesReceived<'a> {
+    pub(crate) struct FileBytesReceived<'a> {
         pub byte_size: usize,
         pub file: &'a str,
         pub include_file_metric_tag: bool,
@@ -188,7 +190,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileEventsReceived<'a> {
+    pub(crate) struct FileEventsReceived<'a> {
         pub count: usize,
         pub file: &'a str,
         pub byte_size: JsonSize,
@@ -221,9 +223,25 @@ mod source {
             }
         }
     }
+}
+
+#[cfg(any(feature = "sources-file", feature = "sources-kubernetes_logs"))]
+mod source {
+    use std::{io::Error, path::Path, time::Duration};
+
+    use bytes::BytesMut;
+    use vector_lib::{
+        NamedInternalEvent, counter, emit,
+        file_source_common::internal_events::FileSourceInternalEvents,
+        internal_event::{
+            ComponentEventsDropped, CounterName, INTENTIONAL, error_stage, error_type,
+        },
+    };
+
+    use super::{FileOpen, InternalEvent};
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileChecksumFailed<'a> {
+    pub(crate) struct FileChecksumFailed<'a> {
         pub file: &'a Path,
         pub include_file_metric_tag: bool,
     }
@@ -247,7 +265,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileFingerprintReadError<'a> {
+    pub(crate) struct FileFingerprintReadError<'a> {
         pub file: &'a Path,
         pub error: Error,
         pub include_file_metric_tag: bool,
@@ -286,7 +304,7 @@ mod source {
     const DELETION_FAILED: &str = "deletion_failed";
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileDeleteError<'a> {
+    pub(crate) struct FileDeleteError<'a> {
         pub file: &'a Path,
         pub error: Error,
         pub include_file_metric_tag: bool,
@@ -323,7 +341,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileDeleted<'a> {
+    pub(crate) struct FileDeleted<'a> {
         pub file: &'a Path,
         pub include_file_metric_tag: bool,
     }
@@ -347,7 +365,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileUnwatched<'a> {
+    pub(crate) struct FileUnwatched<'a> {
         pub file: &'a Path,
         pub include_file_metric_tag: bool,
         pub reached_eof: bool,
@@ -448,7 +466,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileResumed<'a> {
+    pub(crate) struct FileResumed<'a> {
         pub file: &'a Path,
         pub file_position: u64,
         pub include_file_metric_tag: bool,
@@ -474,7 +492,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileAdded<'a> {
+    pub(crate) struct FileAdded<'a> {
         pub file: &'a Path,
         pub include_file_metric_tag: bool,
     }
@@ -498,7 +516,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileCheckpointed {
+    pub(crate) struct FileCheckpointed {
         pub count: usize,
         pub duration: Duration,
     }
@@ -520,7 +538,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileCheckpointWriteError {
+    pub(crate) struct FileCheckpointWriteError {
         pub error: Error,
     }
 
@@ -544,7 +562,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct PathGlobbingError<'a> {
+    pub(crate) struct PathGlobbingError<'a> {
         pub path: &'a Path,
         pub error: &'a Error,
     }
@@ -570,7 +588,7 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileLineTooBigError<'a> {
+    pub(crate) struct FileLineTooBigError<'a> {
         pub truncated_bytes: &'a BytesMut,
         pub configured_limit: usize,
         pub encountered_size_so_far: usize,
@@ -601,7 +619,7 @@ mod source {
     }
 
     #[derive(Clone)]
-    pub struct FileSourceInternalEventsEmitter {
+    pub(crate) struct FileSourceInternalEventsEmitter {
         pub include_file_metric_tag: bool,
     }
 
